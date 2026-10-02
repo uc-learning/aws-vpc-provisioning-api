@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# SAM / CloudFormation
+.aws-sam/
+samconfig.toml
+packaged.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets - never commit these
+.env
+*.pem
+*.key
+credentials
+aws_credentials
+
+# Diagrams - generated files (source DOT files are committed)
+docs/diagrams/*.png
+docs/diagrams/*.svg

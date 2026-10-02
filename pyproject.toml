@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "aws-vpc-provisioning-api"
+version = "1.0.0"
+description = "Serverless VPC Provisioning API"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.4",
+    "pytest-cov==4.1.0",
+    "pytest-mock==3.12.0",
+    # moto: include secretsmanager and kms for new Secrets Manager tests
+    "moto[ec2,dynamodb,stepfunctions,iam,secretsmanager,kms]==5.0.2",
+    "boto3==1.34.34",
+    "pydantic==2.6.1",
+    "ruff==0.2.1",
+    "jsonschema==4.21.1",
+    "requests==2.31.0",
+    # cfn-lint for local SAM template validation
+    "cfn-lint==0.86.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src --cov-report=term-missing --cov-report=html"
+log_cli = true
+log_cli_level = "INFO"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.isort]
+known-first-party = ["common"]

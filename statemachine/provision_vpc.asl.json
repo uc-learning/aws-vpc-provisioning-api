@@ -1,0 +1,460 @@
+{
+  "Comment": "VPC Provisioning Workflow - creates VPC and subnets, persists results, handles failures with compensation.",
+  "StartAt": "UpdateStatusProvisioning",
+  "States": {
+
+    "UpdateStatusProvisioning": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.tableName",
+        "Key": {
+          "requestId": { "S.$": "$.requestId" }
+        },
+        "UpdateExpression": "SET #st = :provisioning, updatedAt = :now",
+        "ConditionExpression": "#st = :pending",
+        "ExpressionAttributeNames": {
+          "#st": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":provisioning": { "S": "PROVISIONING" },
+          ":pending":      { "S": "PENDING" },
+          ":now":          { "S.$": "$$.Execution.StartTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "CreateVpc",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "CreateVpc": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:createVpc",
+      "Parameters": {
+        "CidrBlock.$": "$.cidrBlock",
+        "TagSpecifications": [
+          {
+            "ResourceType": "vpc",
+            "Tags": [
+              { "Key": "Name",        "Value.$": "$.vpcName" },
+              { "Key": "RequestId",   "Value.$": "$.requestId" },
+              { "Key": "ManagedBy",   "Value": "vpc-provisioning-api" },
+              { "Key": "Environment", "Value": "demo" }
+            ]
+          }
+        ]
+      },
+      "ResultSelector": {
+        "vpcId.$":    "$.Vpc.VpcId",
+        "cidrBlock.$": "$.Vpc.CidrBlock",
+        "state.$":    "$.Vpc.State"
+      },
+      "ResultPath": "$.vpcResult",
+      "Next": "EnableDnsSupport",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ec2.RequestLimitExceededException",
+            "Ec2.ThrottlingException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "EnableDnsSupport": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:modifyVpcAttribute",
+      "Parameters": {
+        "VpcId.$":         "$.vpcResult.vpcId",
+        "EnableDnsSupport": {
+          "Value.$": "$.enableDnsSupport"
+        }
+      },
+      "ResultPath": null,
+      "Next": "EnableDnsHostnames",
+      "Retry": [
+        {
+          "ErrorEquals": ["Ec2.RequestLimitExceededException", "States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CompensateVpc",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "EnableDnsHostnames": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:modifyVpcAttribute",
+      "Parameters": {
+        "VpcId.$":            "$.vpcResult.vpcId",
+        "EnableDnsHostnames": {
+          "Value.$": "$.enableDnsHostnames"
+        }
+      },
+      "ResultPath": null,
+      "Next": "WaitForVpcAvailable",
+      "Retry": [
+        {
+          "ErrorEquals": ["Ec2.RequestLimitExceededException", "States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CompensateVpc",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "WaitForVpcAvailable": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:describeVpcs",
+      "Parameters": {
+        "VpcIds.$": "States.Array($.vpcResult.vpcId)"
+      },
+      "ResultSelector": {
+        "state.$": "$.Vpcs[0].State"
+      },
+      "ResultPath": "$.vpcState",
+      "Next": "CheckVpcAvailable",
+      "Retry": [
+        {
+          "ErrorEquals": ["Ec2.RequestLimitExceededException", "States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CompensateVpc",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "CheckVpcAvailable": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.vpcState.state",
+          "StringEquals": "available",
+          "Next": "CreateSubnets"
+        }
+      ],
+      "Default": "WaitBeforeRetryVpcCheck"
+    },
+
+    "WaitBeforeRetryVpcCheck": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "WaitForVpcAvailable"
+    },
+
+    "CreateSubnets": {
+      "Type": "Map",
+      "ItemsPath": "$.subnets",
+      "ItemSelector": {
+        "subnet.$":   "$$.Map.Item.Value",
+        "vpcId.$":    "$.vpcResult.vpcId",
+        "requestId.$": "$.requestId"
+      },
+      "MaxConcurrency": 1,
+      "Iterator": {
+        "StartAt": "CreateSingleSubnet",
+        "States": {
+          "CreateSingleSubnet": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:createSubnet",
+            "Parameters": {
+              "VpcId.$":            "$.vpcId",
+              "CidrBlock.$":        "$.subnet.cidrBlock",
+              "AvailabilityZone.$": "$.subnet.availabilityZone",
+              "TagSpecifications": [
+                {
+                  "ResourceType": "subnet",
+                  "Tags": [
+                    { "Key": "Name",      "Value.$": "$.subnet.name" },
+                    { "Key": "RequestId", "Value.$": "$.requestId" },
+                    { "Key": "ManagedBy", "Value": "vpc-provisioning-api" }
+                  ]
+                }
+              ]
+            },
+            "ResultSelector": {
+              "name.$":             "$.subnet.name",
+              "subnetId.$":         "$.Subnet.SubnetId",
+              "cidrBlock.$":        "$.Subnet.CidrBlock",
+              "availabilityZone.$": "$.Subnet.AvailabilityZone",
+              "state.$":            "$.Subnet.State"
+            },
+            "End": true,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Ec2.RequestLimitExceededException",
+                  "Ec2.ThrottlingException",
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0,
+                "JitterStrategy": "FULL"
+              }
+            ]
+          }
+        }
+      },
+      "ResultPath": "$.subnetResults",
+      "Next": "PersistSucceeded",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CompensateSubnetsAndVpc",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "PersistSucceeded": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.tableName",
+        "Key": {
+          "requestId": { "S.$": "$.requestId" }
+        },
+        "UpdateExpression": "SET #st = :succeeded, vpc = :vpc, subnets = :subnets, updatedAt = :now",
+        "ExpressionAttributeNames": {
+          "#st": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":succeeded": { "S": "SUCCEEDED" },
+          ":vpc": {
+            "M": {
+              "vpcId":     { "S.$": "$.vpcResult.vpcId" },
+              "cidrBlock": { "S.$": "$.vpcResult.cidrBlock" },
+              "state":     { "S.$": "$.vpcResult.state" }
+            }
+          },
+          ":subnets":  { "S.$": "States.JsonToString($.subnetResults)" },
+          ":now":      { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "WorkflowSucceeded",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordFailure",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "WorkflowSucceeded": {
+      "Type": "Succeed"
+    },
+
+    "CompensateSubnetsAndVpc": {
+      "Type": "Task",
+      "Comment": "Best-effort: describe and delete any subnets created by this execution before deleting the VPC.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:describeSubnets",
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "vpc-id",
+            "Values.$": "States.Array($.vpcResult.vpcId)"
+          },
+          {
+            "Name": "tag:RequestId",
+            "Values.$": "States.Array($.requestId)"
+          }
+        ]
+      },
+      "ResultSelector": {
+        "subnetIds.$": "$.Subnets[*].SubnetId"
+      },
+      "ResultPath": "$.compensationSubnets",
+      "Next": "CompensateVpc",
+      "Retry": [
+        {
+          "ErrorEquals": ["Ec2.RequestLimitExceededException", "States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "CompensateVpc",
+          "ResultPath": "$.compensationError"
+        }
+      ]
+    },
+
+    "CompensateVpc": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:deleteVpc",
+      "Parameters": {
+        "VpcId.$": "$.vpcResult.vpcId"
+      },
+      "ResultPath": null,
+      "Next": "RecordRolledBack",
+      "Retry": [
+        {
+          "ErrorEquals": ["Ec2.RequestLimitExceededException", "States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "RecordFailure",
+          "ResultPath": "$.compensationVpcError"
+        }
+      ]
+    },
+
+    "RecordRolledBack": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.tableName",
+        "Key": {
+          "requestId": { "S.$": "$.requestId" }
+        },
+        "UpdateExpression": "SET #st = :rolledBack, #err = :errVal, updatedAt = :now",
+        "ExpressionAttributeNames": {
+          "#st":  "status",
+          "#err": "error"
+        },
+        "ExpressionAttributeValues": {
+          ":rolledBack": { "S": "ROLLED_BACK" },
+          ":errVal": {
+            "M": {
+              "code":    { "S": "PROVISIONING_FAILED_COMPENSATED" },
+              "message": { "S": "Provisioning failed; created resources have been removed." }
+            }
+          },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "WorkflowFailed",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "WorkflowFailed",
+          "ResultPath": null
+        }
+      ]
+    },
+
+    "RecordFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName.$": "$.tableName",
+        "Key": {
+          "requestId": { "S.$": "$.requestId" }
+        },
+        "UpdateExpression": "SET #st = :failed, #err = :errVal, updatedAt = :now",
+        "ExpressionAttributeNames": {
+          "#st":  "status",
+          "#err": "error"
+        },
+        "ExpressionAttributeValues": {
+          ":failed": { "S": "FAILED" },
+          ":errVal": {
+            "M": {
+              "code":    { "S": "PROVISIONING_FAILED" },
+              "message": { "S": "Provisioning encountered an unrecoverable error. Check Step Functions execution history for details." }
+            }
+          },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "WorkflowFailed",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "WorkflowFailed",
+          "ResultPath": null
+        }
+      ]
+    },
+
+    "WorkflowFailed": {
+      "Type": "Fail",
+      "Error": "ProvisioningFailed",
+      "Cause": "VPC provisioning workflow encountered an error. See DynamoDB record and Step Functions execution history."
+    }
+  }
+}

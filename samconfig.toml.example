@@ -1,0 +1,82 @@
+# samconfig.toml.example
+#
+# Copy this file to samconfig.toml and fill in your values.
+# samconfig.toml is in .gitignore — never commit real account IDs, bucket names,
+# or other environment-specific values to the repository.
+#
+# Usage:
+#   cp samconfig.toml.example samconfig.toml
+#   # Edit the [default.deploy.parameters] section below
+#   sam build
+#   sam deploy          # uses values from this file
+
+version = 0.1
+
+# ── Default environment ───────────────────────────────────────────────────────
+
+[default.global.parameters]
+stack_name = "aws-vpc-provisioning-api"
+
+[default.build.parameters]
+use_container = true                    # requires Docker
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+# Replace ALL <placeholder> values before running sam deploy.
+
+# S3 bucket where SAM uploads Lambda deployment packages.
+# Create once: aws s3 mb s3://<your-bucket-name> --region ap-south-1
+s3_bucket          = "<your-sam-artifacts-bucket>"
+s3_prefix          = "vpc-api"
+
+region             = "ap-south-1"
+confirm_changeset  = true
+capabilities       = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+
+# SAM template parameter overrides
+# Format: "Key1=Value1 Key2=Value2"
+parameter_overrides = [
+    "Environment=demo",
+    "LogLevel=INFO",
+    # Must be globally unique across all AWS accounts in this region
+    "CognitoUserPoolDomain=vpc-provisioning-api-demo-<your-unique-suffix>",
+    # Optional: email address for CloudWatch alarm SNS notifications
+    # Leave empty ("") to skip email subscription
+    "AlertEmail=ops-team@example.com",
+    # NOTE: All sensitive/environment-specific config (allowed AZs, CIDR policy,
+    # concurrency limits) lives in the Secrets Manager secret created by the stack:
+    #   /vpc-provisioning-api/<env>/config
+    # Update that secret after deployment — no Lambda redeploy needed.
+    # aws secretsmanager update-secret \
+    #   --secret-id /vpc-provisioning-api/demo/config \
+    #   --secret-string '{"allowed_azs":"ap-south-1a,ap-south-1b","max_subnets_per_request":"10"}'
+]
+
+# Set to false after first deployment to skip the interactive confirmation prompt
+confirm_changeset = false
+
+# Tags applied to the CloudFormation stack (and propagated to supported resources)
+tags = "Project=vpc-provisioning-api Environment=demo Team=engineering"
+
+# ── Demo environment (explicit profile) ──────────────────────────────────────
+# Uncomment and fill in if you maintain named AWS CLI profiles.
+# [demo.deploy.parameters]
+# profile            = "my-demo-aws-profile"
+# stack_name         = "aws-vpc-provisioning-api-demo"
+# s3_bucket          = "<demo-bucket>"
+# region             = "ap-south-1"
+# parameter_overrides = ["Environment=demo", "LogLevel=DEBUG", "CognitoUserPoolDomain=vpc-api-demo-<suffix>"]
+# confirm_changeset   = true
+# capabilities        = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+
+# ── Staging environment ───────────────────────────────────────────────────────
+# [staging.deploy.parameters]
+# profile            = "my-staging-aws-profile"
+# stack_name         = "aws-vpc-provisioning-api-staging"
+# s3_bucket          = "<staging-bucket>"
+# region             = "ap-south-1"
+# parameter_overrides = ["Environment=staging", "LogLevel=INFO", "CognitoUserPoolDomain=vpc-api-staging-<suffix>"]
+# confirm_changeset   = true
+# capabilities        = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"

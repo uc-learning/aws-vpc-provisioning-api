@@ -1,0 +1,224 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "VPC Provisioning API",
+    "version": "1.0.0",
+    "description": "Serverless API to provision AWS VPCs and subnets asynchronously"
+  },
+  "paths": {
+    "/vpcs": {
+      "post": {
+        "operationId": "createVpc",
+        "summary": "Submit a VPC provisioning request",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateVpcRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Request accepted",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AcceptedResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        },
+        "security": [{ "CognitoAuthorizer": [] }]
+      }
+    },
+    "/vpcs/{requestId}": {
+      "get": {
+        "operationId": "getVpc",
+        "summary": "Retrieve provisioning status",
+        "parameters": [
+          {
+            "name": "requestId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Provisioning status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/VpcStatusResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        },
+        "security": [{ "CognitoAuthorizer": [] }]
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "SubnetRequest": {
+        "type": "object",
+        "required": ["name", "cidrBlock", "availabilityZone"],
+        "additionalProperties": false,
+        "properties": {
+          "name":             { "type": "string", "minLength": 1, "maxLength": 256 },
+          "cidrBlock":        { "type": "string" },
+          "availabilityZone": { "type": "string", "minLength": 1, "maxLength": 64 }
+        }
+      },
+      "CreateVpcRequest": {
+        "type": "object",
+        "required": ["name", "cidrBlock", "subnets"],
+        "additionalProperties": false,
+        "properties": {
+          "clientRequestId":   { "type": "string", "minLength": 1, "maxLength": 128 },
+          "name":              { "type": "string", "minLength": 1, "maxLength": 256 },
+          "cidrBlock":         { "type": "string" },
+          "enableDnsSupport":  { "type": "boolean", "default": true },
+          "enableDnsHostnames":{ "type": "boolean", "default": true },
+          "subnets": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": { "$ref": "#/components/schemas/SubnetRequest" }
+          },
+          "tags": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "AcceptedResponse": {
+        "type": "object",
+        "required": ["requestId", "status", "statusUrl"],
+        "properties": {
+          "requestId":  { "type": "string" },
+          "status":     { "$ref": "#/components/schemas/ProvisioningStatus" },
+          "statusUrl":  { "type": "string" }
+        }
+      },
+      "VpcResult": {
+        "type": "object",
+        "required": ["vpcId", "cidrBlock"],
+        "properties": {
+          "vpcId":     { "type": "string" },
+          "cidrBlock": { "type": "string" },
+          "state":     { "type": "string" }
+        }
+      },
+      "SubnetResult": {
+        "type": "object",
+        "required": ["name", "subnetId", "cidrBlock", "availabilityZone"],
+        "properties": {
+          "name":             { "type": "string" },
+          "subnetId":         { "type": "string" },
+          "cidrBlock":        { "type": "string" },
+          "availabilityZone": { "type": "string" },
+          "state":            { "type": "string" }
+        }
+      },
+      "VpcStatusResponse": {
+        "type": "object",
+        "required": ["requestId", "status"],
+        "properties": {
+          "requestId":   { "type": "string" },
+          "status":      { "$ref": "#/components/schemas/ProvisioningStatus" },
+          "requestedBy": { "type": "string" },
+          "createdAt":   { "type": "string", "format": "date-time" },
+          "updatedAt":   { "type": "string", "format": "date-time" },
+          "vpc":         { "$ref": "#/components/schemas/VpcResult" },
+          "subnets": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SubnetResult" }
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code":    { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      },
+      "ProvisioningStatus": {
+        "type": "string",
+        "enum": ["PENDING", "PROVISIONING", "SUCCEEDED", "FAILED", "ROLLED_BACK"]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status":      { "type": "string" },
+          "service":     { "type": "string" },
+          "environment": { "type": "string" }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error", "message"],
+        "properties": {
+          "error":   { "type": "string" },
+          "message": { "type": "string" },
+          "field":   { "type": "string" }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "Unauthorized": {
+        "description": "Authentication required",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      },
+      "Conflict": {
+        "description": "Conflicting request",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } }
+        }
+      }
+    },
+    "securitySchemes": {
+      "CognitoAuthorizer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

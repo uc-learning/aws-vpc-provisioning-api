@@ -1,0 +1,99 @@
+// Step Functions workflow diagram — VPC Provisioning
+// Regenerate PNG: dot -Tpng docs/diagrams/workflow.dot -o docs/diagrams/workflow.png
+
+digraph VpcProvisioningWorkflow {
+
+    graph [
+        label    = "Step Functions Workflow — provision_vpc.asl.json"
+        labelloc = "t"
+        fontname = "Helvetica"
+        fontsize = 16
+        rankdir  = TB
+        pad      = 0.5
+        bgcolor  = "#FAFAFA"
+        splines  = ortho
+        nodesep  = 0.5
+        ranksep  = 0.7
+    ]
+    node [fontname="Helvetica" fontsize=11 margin="0.15,0.1"]
+    edge [fontname="Helvetica" fontsize=9  color="#444444"]
+
+    // ── Start / End ───────────────────────────────────────────────────────────
+    Start [label="START"           shape=circle  style=filled fillcolor="#43A047" fontcolor=white  width=0.8]
+    End   [label="Succeed"         shape=doublecircle style=filled fillcolor="#43A047" fontcolor=white width=0.9]
+    Fail  [label="Fail\n(ProvisioningFailed)" shape=doublecircle style=filled fillcolor="#E53935" fontcolor=white width=1.2]
+
+    // ── Happy path states (blue) ───────────────────────────────────────────────
+    node [shape=box style="rounded,filled" fillcolor="#BBDEFB" color="#0D47A1"]
+
+    S1  [label="UpdateStatus\n→ PROVISIONING\n(DynamoDB)"]
+    S2  [label="CreateVpc\n(EC2 SDK)"]
+    S3  [label="EnableDnsSupport\n(EC2 SDK)"]
+    S4  [label="EnableDnsHostnames\n(EC2 SDK)"]
+    S5  [label="WaitForVpcAvailable\n(DescribeVpcs)"]
+    S6  [label="CreateSubnets\n(Map state, sequential)"]
+    S7  [label="PersistSucceeded\n(DynamoDB UpdateItem)"]
+
+    // ── Choice state (yellow) ─────────────────────────────────────────────────
+    node [shape=diamond style=filled fillcolor="#FFF176" color="#F9A825"]
+    C1  [label="VPC\navailable?"]
+
+    // ── Wait state (light grey) ───────────────────────────────────────────────
+    node [shape=box style="rounded,filled" fillcolor="#ECEFF1" color="#546E7A"]
+    W1  [label="Wait 5s\n(retry describe)"]
+
+    // ── Compensation states (orange) ──────────────────────────────────────────
+    node [shape=box style="rounded,filled" fillcolor="#FFE0B2" color="#E65100"]
+    C2  [label="DescribeSubnets\n(find created subnets)"]
+    C3  [label="DeleteVpc\n(compensation)"]
+
+    // ── Failure recording states (red) ────────────────────────────────────────
+    node [shape=box style="rounded,filled" fillcolor="#FFCDD2" color="#B71C1C"]
+    R1  [label="RecordFailure\n(DynamoDB → FAILED)"]
+    R2  [label="RecordRolledBack\n(DynamoDB → ROLLED_BACK)"]
+
+    // ── Edges: happy path ─────────────────────────────────────────────────────
+    Start -> S1
+    S1    -> S2  [label="  status=PROVISIONING"]
+    S2    -> S3  [label="  VPC created"]
+    S3    -> S4
+    S4    -> S5
+    S5    -> C1
+    C1    -> S6  [label="available=true"  color="#43A047" fontcolor="#43A047"]
+    C1    -> W1  [label="pending"         color="#F9A825" fontcolor="#F57F17"]
+    W1    -> S5  [label="retry"]
+    S6    -> S7  [label="  all subnets created"]
+    S7    -> End [label="  SUCCEEDED"]
+
+    // ── Edges: compensation path ──────────────────────────────────────────────
+    S6    -> C2  [label="subnet failure" style=dashed color="#E65100" fontcolor="#E65100"]
+    C2    -> C3
+    S3    -> C3  [label="dns failure"   style=dashed color="#E65100" fontcolor="#E65100"]
+    S4    -> C3  [label="dns failure"   style=dashed color="#E65100" fontcolor="#E65100"]
+    C3    -> R2
+    R2    -> Fail
+
+    // ── Edges: unrecoverable failure path ─────────────────────────────────────
+    S1    -> R1  [label="DynamoDB error" style=dashed color="#B71C1C" fontcolor="#B71C1C"]
+    S2    -> R1  [label="EC2 error"      style=dashed color="#B71C1C" fontcolor="#B71C1C"]
+    S7    -> R1  [label="persist error"  style=dashed color="#B71C1C" fontcolor="#B71C1C"]
+    R1    -> Fail
+
+    // ── Legend ─────────────────────────────────────────────────────────────────
+    subgraph cluster_legend {
+        label     = "Legend"
+        style     = filled
+        fillcolor = "#F5F5F5"
+        color     = "#9E9E9E"
+        fontsize  = 10
+
+        L1 [label="Happy path"         shape=box style=filled fillcolor="#BBDEFB" color="#0D47A1" fontsize=9]
+        L2 [label="Choice / branching" shape=diamond style=filled fillcolor="#FFF176" color="#F9A825" fontsize=9]
+        L3 [label="Compensation"       shape=box style=filled fillcolor="#FFE0B2" color="#E65100" fontsize=9]
+        L4 [label="Failure recording"  shape=box style=filled fillcolor="#FFCDD2" color="#B71C1C" fontsize=9]
+
+        L1 -> L2 [style=invis]
+        L2 -> L3 [style=invis]
+        L3 -> L4 [style=invis]
+    }
+}

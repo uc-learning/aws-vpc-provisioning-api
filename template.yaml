@@ -1,0 +1,945 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  aws-vpc-provisioning-api
+  Serverless REST API to provision VPCs and subnets asynchronously.
+  Protected by Amazon Cognito. Orchestrated by Step Functions.
+  All sensitive and environment-specific config loaded from AWS Secrets Manager.
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues: [demo, staging, production]
+    Description: Deployment environment name
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  CognitoUserPoolDomain:
+    Type: String
+    Default: vpc-provisioning-api-demo
+    Description: >
+      Cognito hosted-UI domain prefix — must be globally unique across all
+      AWS accounts. Use a suffix with your account ID or org name.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address for operational alerts (SNS alarm subscription).
+      Leave empty to skip email subscription.
+
+# ── Mappings — per-environment values ────────────────────────────────────────
+# These values are NOT sensitive; they are environment-tuning knobs that
+# control infrastructure capacity.  Sensitive values (allowed AZs, CIDR
+# policy, alert contacts) live in the Secrets Manager secret instead.
+
+Mappings:
+
+  EnvironmentConfig:
+    demo:
+      # API Gateway throttle limits
+      ApiThrottlingBurstLimit: 20
+      ApiThrottlingRateLimit:  50
+      # Lambda reserved concurrency (0 = unreserved; set a number to cap)
+      CreateLambdaConcurrency: 10
+      GetLambdaConcurrency:    20
+      # CloudWatch log retention
+      LambdaLogRetentionDays:  14
+      ApiLogRetentionDays:     14
+      SfnLogRetentionDays:     14
+      # DynamoDB PITR
+      EnablePITR:              false
+      # Cognito advanced security
+      CognitoAdvancedSecurity: AUDIT
+    staging:
+      ApiThrottlingBurstLimit: 100
+      ApiThrottlingRateLimit:  200
+      CreateLambdaConcurrency: 20
+      GetLambdaConcurrency:    50
+      LambdaLogRetentionDays:  30
+      ApiLogRetentionDays:     30
+      SfnLogRetentionDays:     30
+      EnablePITR:              true
+      CognitoAdvancedSecurity: ENFORCED
+    production:
+      ApiThrottlingBurstLimit: 500
+      ApiThrottlingRateLimit:  1000
+      CreateLambdaConcurrency: 50
+      GetLambdaConcurrency:    200
+      LambdaLogRetentionDays:  90
+      ApiLogRetentionDays:     90
+      SfnLogRetentionDays:     90
+      EnablePITR:              true
+      CognitoAdvancedSecurity: ENFORCED
+
+# ── Conditions ────────────────────────────────────────────────────────────────
+
+Conditions:
+  IsProduction:      !Equals [!Ref Environment, production]
+  HasAlertEmail:     !Not [!Equals [!Ref AlertEmail, ""]]
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        # Non-sensitive infrastructure references — safe as env vars
+        DYNAMODB_TABLE:    !Ref VpcProvisioningTable
+        ENVIRONMENT:       !Ref Environment
+        LOG_LEVEL:         !Ref LogLevel
+        AWS_REGION_NAME:   !Ref AWS::Region
+        # ARN of the Secrets Manager secret — not the secret value
+        APP_SECRET_ARN:    !Ref AppConfigSecret
+        # Secrets Manager cache TTL in seconds (300 = 5 minutes)
+        SECRETS_CACHE_TTL_SECONDS: "300"
+    Layers:
+      - !Ref CommonLayer
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # KMS Customer Managed Key — encrypts DynamoDB, Secrets Manager, SQS, SNS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  VpcApiKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for vpc-provisioning-api ${Environment}"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: LambdaDecrypt
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt CreateVpcFunctionRole.Arn
+                - !GetAtt GetVpcFunctionRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: "*"
+          - Sid: DynamoDBAccess
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+  VpcApiKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/vpc-provisioning-api-${Environment}"
+      TargetKeyId: !Ref VpcApiKmsKey
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Secrets Manager — application config secret (one per environment)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  AppConfigSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "/vpc-provisioning-api/${Environment}/config"
+      Description: !Sub >
+        Environment-specific operational configuration for vpc-provisioning-api
+        in the ${Environment} environment. Contains limits, AZ allow-lists, and
+        alert contacts. No AWS credentials or tokens should ever be stored here.
+      KmsKeyId: !Ref VpcApiKmsKey
+      SecretString: !Sub |
+        {
+          "allowed_vpc_cidr_ranges": "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+          "max_subnets_per_request": "20",
+          "provisioning_concurrency_limit": "10",
+          "vpc_cidr_min_prefix": "16",
+          "vpc_cidr_max_prefix": "28",
+          "allowed_azs": "${AWS::Region}a,${AWS::Region}b,${AWS::Region}c",
+          "alert_email": "${AlertEmail}"
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: vpc-provisioning-api
+
+  # Automatic rotation is intentionally not enabled on this secret because
+  # it holds operational configuration (not credentials).
+  # If credentials are ever added, enable rotation with a Lambda rotator.
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Lambda Layer — shared common package
+  # ════════════════════════════════════════════════════════════════════════════
+
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "vpc-api-common-${Environment}"
+      Description: Shared Python modules (models, validation, repository, responses, logging, config, secrets)
+      ContentUri: src/
+      CompatibleRuntimes: [python3.11]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.11
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Cognito User Pool
+  # ════════════════════════════════════════════════════════════════════════════
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "vpc-provisioning-${Environment}"
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      UserPoolAddOns:
+        AdvancedSecurityMode: !FindInMap [EnvironmentConfig, !Ref Environment, CognitoAdvancedSecurity]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      DeletionProtection: !If [IsProduction, ACTIVE, INACTIVE]
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "vpc-api-client-${Environment}"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+  CognitoUserPoolDomainResource:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${CognitoUserPoolDomain}-${Environment}"
+      UserPoolId: !Ref CognitoUserPool
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # DynamoDB Table
+  # ════════════════════════════════════════════════════════════════════════════
+
+  VpcProvisioningTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "VpcProvisioningRequests-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !FindInMap [EnvironmentConfig, !Ref Environment, EnablePITR]
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref VpcApiKmsKey
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: requestId
+          AttributeType: S
+        - AttributeName: clientRequestId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: requestId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ClientRequestIdIndex
+          KeySchema:
+            - AttributeName: clientRequestId
+              KeyType: HASH
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [requestId, requestHash, status]
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: vpc-provisioning-api
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SQS Dead-Letter Queue — Lambda async invocation failures
+  # (API Gateway uses sync invocation; DLQ protects against async retries)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "vpc-api-dlq-${Environment}"
+      KmsMasterKeyId: !Ref VpcApiKmsKey
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SNS Topic — operational alerts
+  # ════════════════════════════════════════════════════════════════════════════
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "vpc-api-alerts-${Environment}"
+      KmsMasterKeyId: !Ref VpcApiKmsKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # API Gateway
+  # ════════════════════════════════════════════════════════════════════════════
+
+  VpcApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "vpc-provisioning-api-${Environment}"
+      StageName: !Ref Environment
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId",
+           "ip":"$context.identity.sourceIp",
+           "requestTime":"$context.requestTime",
+           "httpMethod":"$context.httpMethod",
+           "resourcePath":"$context.resourcePath",
+           "status":"$context.status",
+           "protocol":"$context.protocol",
+           "responseLength":"$context.responseLength",
+           "integrationLatency":"$context.integrationLatency",
+           "responseLatency":"$context.responseLatency",
+           "userAgent":"$context.identity.userAgent"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: !FindInMap [EnvironmentConfig, !Ref Environment, ApiThrottlingBurstLimit]
+          ThrottlingRateLimit:  !FindInMap [EnvironmentConfig, !Ref Environment, ApiThrottlingRateLimit]
+          MetricsEnabled: true
+          LoggingLevel: ERROR
+          DataTraceEnabled: false   # never log full request/response bodies
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            Identity:
+              Header: Authorization
+        AddDefaultAuthorizerToCorsPreflight: false
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin:  "'*'"
+        MaxAge:       "'600'"
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: "401"
+          ResponseTemplates:
+            "application/json": '{"error":"UNAUTHORIZED","message":"Authentication required"}'
+        ACCESS_DENIED:
+          StatusCode: "403"
+          ResponseTemplates:
+            "application/json": '{"error":"FORBIDDEN","message":"Access denied"}'
+        DEFAULT_4XX:
+          ResponseTemplates:
+            "application/json": '{"error":"CLIENT_ERROR","message":"$context.error.messageString"}'
+        DEFAULT_5XX:
+          ResponseTemplates:
+            "application/json": '{"error":"INTERNAL_ERROR","message":"An unexpected error occurred"}'
+      # Minimum TLS version — rejects TLS 1.0/1.1 (NFR: security)
+      MinimumCompressionSize: 1024
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/vpc-provisioning-api-${Environment}"
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, ApiLogRetentionDays]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Create VPC Lambda
+  # ════════════════════════════════════════════════════════════════════════════
+
+  CreateVpcFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "vpc-api-create-${Environment}"
+      CodeUri: src/create_vpc/
+      Handler: app.handler
+      Description: "POST /vpcs — validates request, persists PENDING to DynamoDB, starts Step Functions"
+      # Reserved concurrency caps throughput to protect EC2 VPC quotas (NFR: scalability)
+      ReservedConcurrentExecutions: !FindInMap [EnvironmentConfig, !Ref Environment, CreateLambdaConcurrency]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref VpcProvisioningStateMachine
+          # APP_SECRET_ARN is already injected by Globals; listed here for clarity
+      Role: !GetAtt CreateVpcFunctionRole.Arn
+      Events:
+        PostVpcs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VpcApi
+            Path: /vpcs
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  CreateVpcFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/vpc-api-create-${Environment}"
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaLogRetentionDays]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Get VPC Lambda
+  # ════════════════════════════════════════════════════════════════════════════
+
+  GetVpcFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "vpc-api-get-${Environment}"
+      CodeUri: src/get_vpc/
+      Handler: app.handler
+      Description: "GET /vpcs/{requestId} — returns provisioning status from DynamoDB"
+      ReservedConcurrentExecutions: !FindInMap [EnvironmentConfig, !Ref Environment, GetLambdaConcurrency]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      Role: !GetAtt GetVpcFunctionRole.Arn
+      Events:
+        GetVpc:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VpcApi
+            Path: /vpcs/{requestId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  GetVpcFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/vpc-api-get-${Environment}"
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, LambdaLogRetentionDays]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Health Lambda (unauthenticated)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "vpc-api-health-${Environment}"
+      CodeUri: src/health/
+      Handler: app.handler
+      Description: "GET /health — unauthenticated liveness probe"
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt GetVpcFunctionRole.Arn
+      Events:
+        Health:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VpcApi
+            Path: /health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  HealthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/vpc-api-health-${Environment}"
+      RetentionInDays: 14
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Step Functions State Machine
+  # ════════════════════════════════════════════════════════════════════════════
+
+  VpcProvisioningStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "vpc-provisioning-${Environment}"
+      DefinitionUri: statemachine/provision_vpc.asl.json
+      Role: !GetAtt StateMachineRole.Arn
+      Tracing:
+        Enabled: true
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL   # ALL captures input/output for every state (useful for debugging)
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/vpc-provisioning-${Environment}"
+      RetentionInDays: !FindInMap [EnvironmentConfig, !Ref Environment, SfnLogRetentionDays]
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # IAM — Create VPC Lambda Role
+  # ════════════════════════════════════════════════════════════════════════════
+
+  CreateVpcFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "vpc-api-create-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt VpcProvisioningTable.Arn
+                  - !Sub "${VpcProvisioningTable.Arn}/index/*"
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref VpcProvisioningStateMachine
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AppConfigSecret
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt VpcApiKmsKey.Arn
+        - PolicyName: SQSDeadLetter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # IAM — Get VPC Lambda Role (read-only)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  GetVpcFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "vpc-api-get-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt VpcProvisioningTable.Arn
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AppConfigSecret
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt VpcApiKmsKey.Arn
+        - PolicyName: SQSDeadLetter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDeadLetterQueue.Arn
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # IAM — Step Functions Role
+  # ════════════════════════════════════════════════════════════════════════════
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "vpc-provisioning-sfn-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies:
+        - PolicyName: EC2VpcProvisioning
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateVpc
+                  - ec2:DeleteVpc
+                  - ec2:DescribeVpcs
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:DescribeSubnets
+                  - ec2:CreateTags
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:RequestedRegion": !Ref AWS::Region
+        - PolicyName: DynamoDBUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt VpcProvisioningTable.Arn
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt VpcApiKmsKey.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutLogEvents
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+        - PolicyName: XRayTracing
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CloudWatch Alarms
+  # All alarms notify the SNS AlertTopic so that email/PagerDuty/Slack
+  # integrations can be added without redeploying the stack (NFR: observability)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  AlarmCreateLambdaErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-api-create-lambda-errors-${Environment}"
+      AlarmDescription: Create VPC Lambda error rate is elevated
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateVpcFunction
+      AlarmActions: [!Ref AlertTopic]
+      OKActions:    [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  AlarmCreateLambdaThrottles:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-api-create-lambda-throttles-${Environment}"
+      AlarmDescription: Create VPC Lambda is being throttled (reserved concurrency exhausted)
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateVpcFunction
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  AlarmStateMachineFailures:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-provisioning-sfn-failures-${Environment}"
+      AlarmDescription: Step Functions provisioning workflow failures are elevated
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref VpcProvisioningStateMachine
+      AlarmActions: [!Ref AlertTopic]
+      OKActions:    [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  AlarmStateMachineThrottled:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-provisioning-sfn-throttled-${Environment}"
+      AlarmDescription: Step Functions executions are being throttled
+      MetricName: ExecutionsThrottled
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref VpcProvisioningStateMachine
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  AlarmApiGateway5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-api-gateway-5xx-${Environment}"
+      AlarmDescription: API Gateway 5xx error rate is elevated
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "vpc-provisioning-api-${Environment}"
+      AlarmActions: [!Ref AlertTopic]
+      OKActions:    [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  AlarmDynamoDBThrottle:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-api-dynamodb-throttle-${Environment}"
+      AlarmDescription: DynamoDB request throttles on provisioning table
+      MetricName: SystemErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref VpcProvisioningTable
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  AlarmDLQMessageCount:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "vpc-api-dlq-messages-${Environment}"
+      AlarmDescription: Messages arrived in the Lambda DLQ — Lambda async invocations failed
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt LambdaDeadLetterQueue.QueueName
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+
+Outputs:
+
+  ApiEndpoint:
+    Description: API Gateway base URL
+    Value: !Sub "https://${VpcApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "vpc-api-endpoint-${Environment}"
+
+  ApiId:
+    Description: API Gateway REST API ID
+    Value: !Ref VpcApi
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "vpc-api-cognito-pool-id-${Environment}"
+
+  CognitoUserPoolClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub "vpc-api-cognito-client-id-${Environment}"
+
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref VpcProvisioningTable
+    Export:
+      Name: !Sub "vpc-api-dynamodb-table-${Environment}"
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref VpcProvisioningStateMachine
+    Export:
+      Name: !Sub "vpc-api-state-machine-arn-${Environment}"
+
+  AppConfigSecretArn:
+    Description: >
+      ARN of the Secrets Manager secret that holds environment-specific
+      operational configuration. Update this secret to change limits or
+      allowed AZs without redeploying Lambda functions.
+    Value: !Ref AppConfigSecret
+    Export:
+      Name: !Sub "vpc-api-config-secret-arn-${Environment}"
+
+  KmsKeyArn:
+    Description: CMK ARN used to encrypt DynamoDB, Secrets Manager, SQS, and SNS
+    Value: !GetAtt VpcApiKmsKey.Arn
+    Export:
+      Name: !Sub "vpc-api-kms-key-arn-${Environment}"
+
+  AlertTopicArn:
+    Description: SNS topic ARN for operational alarms
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub "vpc-api-alert-topic-arn-${Environment}"
+
+  DLQArn:
+    Description: Dead-letter queue ARN for Lambda async invocation failures
+    Value: !GetAtt LambdaDeadLetterQueue.Arn
+
+  CreateVpcFunctionArn:
+    Description: Create VPC Lambda ARN
+    Value: !GetAtt CreateVpcFunction.Arn
+
+  GetVpcFunctionArn:
+    Description: Get VPC Lambda ARN
+    Value: !GetAtt GetVpcFunction.Arn

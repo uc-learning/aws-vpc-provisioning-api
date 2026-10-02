@@ -1,0 +1,139 @@
+// Architecture diagram — VPC Provisioning API
+// Regenerate PNG: dot -Tpng docs/diagrams/architecture.dot -o docs/diagrams/architecture.png
+// Requires Graphviz: https://graphviz.org/download/
+
+digraph VpcProvisioningArchitecture {
+
+    // ── Graph defaults ───────────────────────────────────────────────────────
+    graph [
+        label       = "AWS VPC Provisioning API — Architecture"
+        labelloc    = "t"
+        fontname    = "Helvetica"
+        fontsize    = 18
+        rankdir     = LR
+        pad         = 0.6
+        splines     = ortho
+        bgcolor     = "#FAFAFA"
+        nodesep     = 0.7
+        ranksep     = 1.2
+    ]
+    node  [fontname="Helvetica" fontsize=12 shape=box style="rounded,filled" margin="0.2,0.1"]
+    edge  [fontname="Helvetica" fontsize=10 color="#555555"]
+
+    // ── Colour palette ────────────────────────────────────────────────────────
+    // Client
+    Client          [label="API Client\n(curl / script)"        fillcolor="#E8F0FE" color="#4285F4"]
+
+    // ── Cluster: Authentication ───────────────────────────────────────────────
+    subgraph cluster_auth {
+        label       = "Authentication"
+        style       = filled
+        fillcolor   = "#FFF8E1"
+        color       = "#F9A825"
+        fontname    = "Helvetica-Bold"
+
+        Cognito     [label="Amazon Cognito\nUser Pool"           fillcolor="#FFF3E0" color="#F57C00"]
+    }
+
+    // ── Cluster: API Layer ────────────────────────────────────────────────────
+    subgraph cluster_api {
+        label       = "API Layer"
+        style       = filled
+        fillcolor   = "#E8F5E9"
+        color       = "#388E3C"
+        fontname    = "Helvetica-Bold"
+
+        APIGW       [label="API Gateway\nREST API\n(Cognito Authorizer)"  fillcolor="#C8E6C9" color="#2E7D32"]
+    }
+
+    // ── Cluster: Compute ──────────────────────────────────────────────────────
+    subgraph cluster_compute {
+        label       = "Compute (Lambda)"
+        style       = filled
+        fillcolor   = "#F3E5F5"
+        color       = "#7B1FA2"
+        fontname    = "Helvetica-Bold"
+
+        CreateLambda [label="Create VPC Lambda\nPOST /vpcs\n(Python 3.11)"  fillcolor="#E1BEE7" color="#6A1B9A"]
+        GetLambda    [label="Get VPC Lambda\nGET /vpcs/{id}\n(Python 3.11)" fillcolor="#E1BEE7" color="#6A1B9A"]
+        HealthLambda [label="Health Lambda\nGET /health\n(Python 3.11)"     fillcolor="#E1BEE7" color="#6A1B9A"]
+    }
+
+    // ── Cluster: Orchestration ────────────────────────────────────────────────
+    subgraph cluster_orchestration {
+        label       = "Orchestration"
+        style       = filled
+        fillcolor   = "#E3F2FD"
+        color       = "#1565C0"
+        fontname    = "Helvetica-Bold"
+
+        SFN         [label="Step Functions\nStandard Workflow\n(provision_vpc.asl.json)" fillcolor="#BBDEFB" color="#0D47A1"]
+    }
+
+    // ── Cluster: Persistence ──────────────────────────────────────────────────
+    subgraph cluster_persistence {
+        label       = "Persistence"
+        style       = filled
+        fillcolor   = "#FCE4EC"
+        color       = "#C62828"
+        fontname    = "Helvetica-Bold"
+
+        DynamoDB    [label="DynamoDB\nVpcProvisioningRequests\n(PK: requestId)"  fillcolor="#FFCDD2" color="#B71C1C"]
+    }
+
+    // ── Cluster: Infrastructure ───────────────────────────────────────────────
+    subgraph cluster_infra {
+        label       = "AWS Infrastructure"
+        style       = filled
+        fillcolor   = "#E0F2F1"
+        color       = "#00695C"
+        fontname    = "Helvetica-Bold"
+
+        EC2VPC      [label="Amazon EC2\nCreateVpc\nCreateSubnet\nModifyVpcAttribute" fillcolor="#B2DFDB" color="#004D40"]
+    }
+
+    // ── Cluster: Observability ────────────────────────────────────────────────
+    subgraph cluster_observability {
+        label       = "Observability"
+        style       = filled
+        fillcolor   = "#FFF9C4"
+        color       = "#F57F17"
+        fontname    = "Helvetica-Bold"
+
+        CW          [label="CloudWatch\nLogs + Metrics\n+ Alarms"    fillcolor="#FFF176" color="#E65100"]
+        XRay        [label="AWS X-Ray\nDistributed\nTracing"         fillcolor="#FFF176" color="#E65100"]
+        CloudTrail  [label="CloudTrail\nAudit Log"                   fillcolor="#FFF176" color="#E65100"]
+    }
+
+    // ── Edges: happy path request flow ────────────────────────────────────────
+    Client      -> Cognito      [label="1. Login\n(get JWT)"          color="#F57C00" style=dashed]
+    Client      -> APIGW        [label="2. POST /vpcs\nAuthorization: Bearer <JWT>"]
+    APIGW       -> Cognito      [label="3. Validate JWT"              color="#F57C00" style=dashed]
+    APIGW       -> CreateLambda [label="4. Invoke"]
+    CreateLambda -> DynamoDB    [label="5. PutItem\n(PENDING)"]
+    CreateLambda -> SFN         [label="6. StartExecution"]
+    CreateLambda -> APIGW       [label="7. 202 Accepted\n{requestId}" dir=back]
+
+    // GET path
+    Client      -> APIGW        [label="8. GET /vpcs/{id}"]
+    APIGW       -> GetLambda    [label="9. Invoke"]
+    GetLambda   -> DynamoDB     [label="10. GetItem"]
+    GetLambda   -> APIGW        [label="11. 200 OK\n{status, vpc, subnets}" dir=back]
+
+    // Step Functions → EC2 and DynamoDB
+    SFN         -> EC2VPC       [label="CreateVpc\nCreateSubnet\n(SDK integration)" color="#0D47A1"]
+    SFN         -> DynamoDB     [label="UpdateItem\n(PROVISIONING→\nSUCCEEDED/FAILED)" color="#0D47A1"]
+
+    // Health path
+    Client      -> APIGW        [label="GET /health\n(no auth)"]
+    APIGW       -> HealthLambda [label="Invoke"]
+
+    // Observability
+    CreateLambda -> CW          [style=dotted color="#888888"]
+    GetLambda    -> CW          [style=dotted color="#888888"]
+    SFN          -> CW          [style=dotted color="#888888"]
+    APIGW        -> CW          [style=dotted color="#888888"]
+    EC2VPC       -> CloudTrail  [style=dotted color="#888888"]
+    CreateLambda -> XRay        [style=dotted color="#888888"]
+    GetLambda    -> XRay        [style=dotted color="#888888"]
+}
